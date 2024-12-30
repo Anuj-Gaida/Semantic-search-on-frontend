@@ -2,6 +2,89 @@ import React, { useState, useEffect, useRef } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import data from '../banepa.json';
+import CryptoJS from 'crypto-js';
+import { pipeline } from '@huggingface/transformers';
+
+
+// Initialize the pipeline and cache
+let extractor = null;
+const embeddingCache = {};
+
+// Function to initialize the Hugging Face pipeline
+async function initializePipeline() {
+  if (!extractor) {
+      extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+  }
+}
+
+// Function to generate embeddings with caching
+async function generateEmbeddings(documents) {
+  try {
+      if (!extractor) {
+          await initializePipeline(); // Ensure extractor is initialized
+      }
+
+      const embeddings = await Promise.all(documents.map(async (doc) => {
+          const docHash = CryptoJS.SHA256(doc).toString(); // Use crypto-js for hashing
+          if (embeddingCache[docHash]) {
+              return embeddingCache[docHash];
+          }
+
+          const result = await extractor(doc, { pooling: 'mean', normalize: true });
+          const embeddingData = Array.from(result.data);
+          embeddingCache[docHash] = embeddingData;
+          return embeddingData;
+      }));
+
+      return embeddings;
+  } catch (err) {
+      console.error('Error generating embeddings:', err);
+      throw err;
+  }
+}
+
+// Function to calculate similarity and return matching results
+function findSimilarJsonWithThreshold(queryEmbedding, embeddings, jsonData, threshold = 0.3) {
+  return embeddings
+      .map((docEmbedding, index) => {
+          const similarityScore = cos_sim(queryEmbedding, docEmbedding);
+          return similarityScore >= threshold
+              ? { jsonObject: jsonData[index], score: similarityScore }
+              : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+}
+
+// Function to process the data and generate embeddings
+async function loadAndProcessData() {
+  try {
+      const documents = data.map((item) =>
+          Object.values(item)
+              .filter(Boolean)
+              .join(' - ')
+      );
+
+      console.log('First Document:', documents[0]);
+
+      const embeddings = await generateEmbeddings(documents);
+
+      return { jsonData, embeddings };
+  } catch (err) {
+      console.error('Error processing data:', err);
+      throw err;
+  }
+}
+
+// Function to calculate cosine similarity
+function cos_sim(vec1, vec2) {
+  const dotProduct = vec1.reduce((sum, v, i) => sum + v * vec2[i], 0);
+  const magnitude1 = Math.sqrt(vec1.reduce((sum, v) => sum + v * v, 0));
+  const magnitude2 = Math.sqrt(vec2.reduce((sum, v) => sum + v * v, 0));
+  return magnitude1 && magnitude2 ? dotProduct / (magnitude1 * magnitude2) : 0;
+}
+
+
 
 const emojisAndMessages = [
   { emoji: "🌍", message: "Loading the map interface..." },
@@ -105,33 +188,34 @@ export default function MapExplorer() {
     history.pushState({ query: searchQuery, bbox }, '', newURL);
   };
 
-  const tfidfSearch = (searchQuery) => {
-    const queryTerms = searchQuery.toLowerCase().split(" ");
-    const results = data.map(row => {
-      const description = row.description_from_model.toLowerCase();
-      let score = 0;
-      queryTerms.forEach(term => {
-        score += (description.split(term).length - 1);
-      });
-      return { ...row, score };
-    }).filter(item => item.score > 0);
 
-    results.sort((a, b) => b.score - a.score);
-    return results;
-  };
-
-  const performSearch = (searchQuery = query) => {
+  const performSearch = async(searchQuery = query) => {
     if (!searchQuery.trim()) {
       alert("Please enter a question.");
       return;
     }
+    const data = await loadAndProcessData();
+    const queryResults = await extractor(searchQuery, { pooling: 'mean', normalize: true });
+    const queryEmbedding = Array.from(queryResults.data);
+    
+    const threshold = 0.3; // You can also make this configurable if needed
+    const similarResults = findSimilarJsonWithThreshold(queryEmbedding, embeddings, data, threshold);
+ 
+    setFilteredData(similarResults);
+    setResultsCount(similarResults.length);
+    console.log(`\nResults for Query: "${searchQuery}"`);
+    similarResults.forEach(({ jsonObject, score }, idx) => {
+        console.log(`\nMatch ${idx + 1}:`);
+        console.log(`Similarity Score: ${score.toFixed(4)}`);
+        console.log(`JSON Object:`, jsonObject);
+        console.log('-'.repeat(50));
+    });
 
-    const results = tfidfSearch(searchQuery);
-    setFilteredData(results);
-    setResultsCount(results.length);
+    console.log(`\nTotal Matches Found: ${similarResults.length}`);
+
 
     if (results.length > 0) {
-      const geoJSON = generateGeoJSONFromResults(results);
+      const geoJSON = generateGeoJSONFromResults(similarResults);
       displayGeoJSONLayer(geoJSON);
     }
 
